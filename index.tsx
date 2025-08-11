@@ -139,6 +139,9 @@ class DeviceDriver {
     private db: IDBDatabase | null = null;
 
     async init() {
+        if (localStorage.getItem('wsip_violation') === 'true') {
+            return Promise.reject(new Error("WSIP VIOLATION: System integrity has been compromised. Refusing to boot."));
+        }
         return new Promise<void>((resolve, reject) => {
             const request = indexedDB.open('WinuxSystemMemoryDB', 1);
             request.onerror = () => reject("BIOS Error: IndexedDB could not be opened.");
@@ -149,6 +152,33 @@ class DeviceDriver {
             request.onupgradeneeded = (event) => {
                 const db = (event.target as IDBOpenDBRequest).result;
                 db.createObjectStore('system_memory');
+            };
+        });
+    }
+
+    async destroySystemMemory() {
+        return new Promise<void>((resolve, reject) => {
+            if (!this.db) {
+                localStorage.setItem('wsip_violation', 'true');
+                resolve();
+                return;
+            }
+            this.db.close();
+            this.db = null;
+            const deleteRequest = indexedDB.deleteDatabase('WinuxSystemMemoryDB');
+            deleteRequest.onsuccess = () => {
+                localStorage.setItem('wsip_violation', 'true');
+                console.log("System memory destroyed due to integrity violation.");
+                resolve();
+            };
+            deleteRequest.onerror = () => {
+                localStorage.setItem('wsip_violation', 'true');
+                reject("Could not destroy system memory, but violation was flagged.");
+            };
+            deleteRequest.onblocked = () => {
+                localStorage.setItem('wsip_violation', 'true');
+                console.warn("System memory destruction was blocked. A refresh may be required.");
+                resolve();
             };
         });
     }
@@ -380,6 +410,7 @@ class VFS {
     private nextInodeNum = ROOT_INODE_NUM;
     private inodeMap: Map<number, number> = new Map();
     private pathCache: Map<string, number> = new Map();
+    private inodeToPathCache: Map<number, string> = new Map();
     private kernel: Kernel;
 
     constructor(kernel: Kernel, vfsPartitionStart: number, vfsPartitionEnd: number) {
@@ -445,6 +476,7 @@ class VFS {
         const rootIno = this.allocInode(INODE_MODE_DIR);
         if (rootIno !== ROOT_INODE_NUM) throw new Error("VFS: Root inode must be 2");
         this.pathCache.set('/', rootIno);
+        this.inodeToPathCache.set(rootIno, '/');
         
         // --- Create Linux-like directory structure ---
         const homeIno = this.createDir(rootIno, 'home');
@@ -709,6 +741,7 @@ sysfs           /sys            sysfs   defaults        0       0
             if (!found) return null;
         }
         this.pathCache.set(absolutePath, currentIno);
+        this.inodeToPathCache.set(currentIno, absolutePath);
         return currentIno;
     }
 
@@ -767,9 +800,24 @@ sysfs           /sys            sysfs   defaults        0       0
 
     readFileContentByInode = (ino: number): string => decoder.decode(this.readFileBytesByInode(ino));
 
+    findPathByInode = (ino: number): string | null => {
+        if (this.inodeToPathCache.has(ino)) {
+            return this.inodeToPathCache.get(ino)!;
+        }
+        console.warn(`Path for inode ${ino} not in cache. This may cause issues with WSIP.`);
+        return null;
+    }
+
     updateFileContentByInode = (ino: number, content: string | Uint8Array, force: boolean = false) => {
         const inode = this.readInode(ino);
         if (!inode || inode.type !== 'file') return false;
+
+        const absolutePath = this.findPathByInode(ino);
+        if (absolutePath && this.kernel.protectedFiles.includes(absolutePath) && !force) {
+            this.kernel.triggerSystemIntegrityViolation(`Attempted to modify protected system file: ${absolutePath}`);
+            return false;
+        }
+
         if (!force && (inode.mode & 0o000200) === 0) { throw new Error('Permission denied: File is read-only.'); }
         if (inode.firstBlock) {
             this.freeBlockChain(inode.firstBlock);
@@ -811,6 +859,8 @@ class Kernel {
     public memory: ArrayBuffer | SharedArrayBuffer;
     private view: DataView;
     public apiKey: string;
+    public deviceDriver: DeviceDriver;
+    public protectedFiles: string[];
     public memoryMap: {
         KERNEL_SPACE_START: number, KERNEL_SPACE_END: number,
         VFS_PARTITION_START: number, VFS_PARTITION_END: number,
@@ -838,11 +888,19 @@ class Kernel {
     };
     public apps: Record<string, AppDefinition>;
 
-    constructor(systemMemory: ArrayBuffer | SharedArrayBuffer) {
+    constructor(systemMemory: ArrayBuffer | SharedArrayBuffer, deviceDriver: DeviceDriver) {
         this.memory = systemMemory;
         this.view = new DataView(this.memory);
-        this.apiKey = 'REPLACE_WITH_YOUR_API_KEY';
+        this.deviceDriver = deviceDriver;
+        this.apiKey = 'AIzaSyDUbYuw4hl5RLsIJnXWyFF-q5p6ezxpK5E';
         this.apps = {};
+        this.protectedFiles = [
+            '/boot/vmlinuz-3.0.0-winux',
+            '/boot/initrd-3.0.0-winux',
+            '/sys/module/drivers/device',
+            '/sys/module/drivers/network',
+            '/boot/grub/grub.cfg',
+        ];
         this.settings = {
             theme: 'dark',
             wallpaper: `https://source.unsplash.com/random/1920x1080?nature,water`,
@@ -931,6 +989,11 @@ class Kernel {
         document.body.innerHTML = '';
         document.body.appendChild(bsodDiv);
         document.body.style.backgroundColor = '#0078d4';
+    }
+
+    triggerSystemIntegrityViolation = (details: string) => {
+        this.triggerBSOD(`SYSTEM_INTEGRITY_VIOLATION\n\n${details}`);
+        this.deviceDriver.destroySystemMemory();
     }
 
     // --- SYSCALL HANDLER ---
@@ -1622,7 +1685,7 @@ const App = () => {
                 }
 
                 await addMessage('[    0.501112] Kernel: Initializing...', 150);
-                const kernel = new Kernel(systemMemory);
+                const kernel = new Kernel(systemMemory, deviceDriver);
                 
                 await addMessage('[    0.623456] VFS: Mounting root (vfs filesystem) on /dev/ram0...', 100);
                 await kernel.bootstrap();
@@ -1639,7 +1702,13 @@ const App = () => {
                 console.error("Boot failed:", error);
                 const bsod = document.createElement('div');
                 bsod.className = 'bsod';
-                bsod.innerHTML = `<h1>:(</h1><p>A fatal error occurred during boot.</p><div class="bsod-details">Stop code: KERNEL_INIT_FAILURE<br/>Details: ${(error as Error).message}</div>`;
+                let message = (error as Error).message;
+                let stopCode = 'KERNEL_INIT_FAILURE';
+                 if (message.includes('WSIP VIOLATION')) {
+                    stopCode = 'WSIP_VIOLATION';
+                    message = "System integrity has been compromised and memory has been wiped.\nThe system can no longer boot.";
+                }
+                bsod.innerHTML = `<h1>:(</h1><p>A fatal error occurred during boot.</p><div class="bsod-details">Stop code: ${stopCode}<br/>Details: ${message}</div>`;
                 document.body.innerHTML = '';
                 document.body.appendChild(bsod);
                 document.body.style.backgroundColor = '#0078d4';
@@ -2970,6 +3039,8 @@ class Kernel {
     public memory: ArrayBuffer | SharedArrayBuffer;
     private view: DataView;
     public apiKey: string;
+    public deviceDriver: DeviceDriver;
+    public protectedFiles: string[];
     public memoryMap: {
         KERNEL_SPACE_START: number, KERNEL_SPACE_END: number,
         VFS_PARTITION_START: number, VFS_PARTITION_END: number,
@@ -2997,11 +3068,19 @@ class Kernel {
     };
     public apps: Record<string, AppDefinition>;
 
-    constructor(systemMemory: ArrayBuffer | SharedArrayBuffer) {
+    constructor(systemMemory: ArrayBuffer | SharedArrayBuffer, deviceDriver: DeviceDriver) {
         this.memory = systemMemory;
         this.view = new DataView(this.memory);
-        this.apiKey = 'REPLACE_WITH_YOUR_API_KEY';
+        this.deviceDriver = deviceDriver;
+        this.apiKey = 'AIzaSyDUbYuw4hl5RLsIJnXWyFF-q5p6ezxpK5E';
         this.apps = {};
+        this.protectedFiles = [
+            '/boot/vmlinuz-3.0.0-winux',
+            '/boot/initrd-3.0.0-winux',
+            '/sys/module/drivers/device',
+            '/sys/module/drivers/network',
+            '/boot/grub/grub.cfg',
+        ];
         this.settings = {
             theme: 'dark',
             wallpaper: \`https://source.unsplash.com/random/1920x1080?nature,water\`,
