@@ -1,0 +1,7 @@
+{
+  "name": "Winux OS",
+  "description": "A web-based OS with persistent binary storage, a package manager (apt-get), and support for third-party apps (.wap).",
+  "requestFramePermissions": [],
+  "prompt": "",
+  "crossOriginIsolated": true
+}
